@@ -1,4 +1,4 @@
-﻿//  Copyright GenericMessagePlugin, Inc. All Rights Reserved.
+//  Copyright GenericMessagePlugin, Inc. All Rights Reserved.
 
 #include "GMPBPLib.h"
 
@@ -15,6 +15,7 @@
 #include "GMPArchive.h"
 #include "GMPReflection.h"
 #include "GMPSerializer.h"
+#include "GMPStoreCollection.h"
 #include "GameFramework/PlayerController.h"
 #include "Templates/TypeHash.h"
 #include "UObject/ObjectKey.h"
@@ -469,8 +470,10 @@ FGMPTypedAddr UGMPBPLib::ListenMessageByKey(FName MessageKey, const FGMPScriptDe
 		}
 		else if (EnumHasAllFlags((EMessageAuthorityType)Type, EMessageTypeClient))
 		{
-			if (NetMode == NM_DedicatedServer && NetMode == NM_ListenServer)
-				{}
+			if (NetMode == NM_DedicatedServer || NetMode == NM_ListenServer)
+			{
+				break;
+			}
 		}
 		else if (EnumHasAllFlags((EMessageAuthorityType)Type, EMessageTypeServer))
 		{
@@ -570,8 +573,10 @@ FGMPTypedAddr UGMPBPLib::ListenMessageViaKey(UObject* Listener, FName MessageKey
 		}
 		else if (EnumHasAllFlags((EMessageAuthorityType)Type, EMessageTypeClient))
 		{
-			if (NetMode == NM_DedicatedServer && NetMode == NM_ListenServer)
-				{}
+			if (NetMode == NM_DedicatedServer || NetMode == NM_ListenServer)
+			{
+				break;
+			}
 		}
 		else if (EnumHasAllFlags((EMessageAuthorityType)Type, EMessageTypeServer))
 		{
@@ -753,6 +758,81 @@ FGMPTypedAddr UGMPBPLib::ListenMessageViaKeyValidate(const TArray<FName>& ArgNam
 	return ListenMessageViaKey(Listener, MessageKey, EventName, Times, Order, Type, BodyDataMask, Mgr, SigPair, ParmBitMask);
 }
 
+FGMPTypedAddr UGMPBPLib::ListenRowViaKey(UObject* Listener, FName MessageKey, FName EventName, int32 Index, int32 Times, int32 Order, uint8 Type, UGMPManager* Mgr, const FGMPObjNamePair& SigPair)
+{
+#if GMP_TRACE_MSG_STACK
+	FString MsgStr = MessageKey.ToString();
+	GMP::FGMPTraceBPGuard Guard(MsgStr);
+#endif
+	using namespace GMP;
+	FGMPTypedAddr ret;
+	ret.Value = 0;
+	do
+	{
+		UWorld* World = Listener ? Listener->GetWorld() : nullptr;
+		if (!ensureAlwaysMsgf(World, TEXT("no world exist with Listener:%s"), *GetPathNameSafe(Listener)))
+			break;
+
+		UFunction* Function = Listener->FindFunction(EventName);
+		if (!ensureWorld(World, Function))
+		{
+			FFrame::KismetExecutionMessage(TEXT("Event Is Invalid"), ELogVerbosity::Error);
+			break;
+		}
+
+		// The row event signature is fixed: (int32 Row, <element struct> Item).
+		FProperty* RowProp = nullptr;
+		FStructProperty* ItemProp = nullptr;
+		{
+			TFieldIterator<FProperty> It(Function);
+			if (It && It->HasAnyPropertyFlags(CPF_Parm))
+			{
+				RowProp = *It;
+				++It;
+				if (It && It->HasAnyPropertyFlags(CPF_Parm))
+					ItemProp = CastField<FStructProperty>(*It);
+			}
+		}
+		if (!ensureWorldMsgf(World, RowProp && RowProp->IsA<FIntProperty>() && ItemProp && ItemProp->Struct, TEXT("row event %s must take (int32 Row, StructItem)"), *EventName.ToString()))
+			break;
+
+		auto NetMode = World->GetNetMode();
+		if (EnumHasAllFlags((EMessageAuthorityType)Type, EMessageTypeBoth))
+		{
+		}
+		else if (EnumHasAllFlags((EMessageAuthorityType)Type, EMessageTypeClient))
+		{
+			if (NetMode == NM_DedicatedServer || NetMode == NM_ListenServer)
+				break;
+		}
+		else if (EnumHasAllFlags((EMessageAuthorityType)Type, EMessageTypeServer))
+		{
+			if (NetMode == NM_Client)
+				break;
+		}
+
+		Mgr = Mgr ? Mgr : FMessageUtils::GetManager();
+		auto SigSource = GMP::FSigSource::MakeSigSourceKey(SigPair.Obj ? SigPair.Obj : (UObject*)World, SigPair.TagName);
+
+		// Blueprint rides the shared row entry and only bridges the pair to its own UFunction call.
+		const UScriptStruct* EventStruct = ItemProp->Struct;
+		const FGMPKey LifeKey = GMPListenScriptRows(
+			SigSource, MessageKey, Listener, Index,
+			[Listener, Function, EventStruct](const FGMPTypedAddr* Addrs, int32 Num, const UScriptStruct* ElemStruct) {
+				// A table of the wrong struct is caught here rather than silently reinterpreted by the event.
+				if (ElemStruct != EventStruct)
+				{
+					GMP_WARNING(TEXT("row event %s expects %s but the store holds %s"), *Function->GetName(), *GetNameSafe(EventStruct), *GetNameSafe(ElemStruct));
+					return;
+				}
+				UGMPBPLib::CallMessageFunction(Listener, Function, MakeArrayView(Addrs, Num), 0);
+			},
+			{Times, Order});
+		ret.Value = LifeKey;
+	} while (0);
+	return ret;
+}
+
 static FGMPKey RequestMessageImpl(FGMPKey& RspKey, FName EventName, const FString& MessageKey, const FGMPObjNamePair& SigPair, GMP::FTypedAddresses& Params, uint8 Type, UGMPManager* Mgr)
 {
 	GMP::FGMPTraceBPGuard Guard(MessageKey);
@@ -785,8 +865,10 @@ static FGMPKey RequestMessageImpl(FGMPKey& RspKey, FName EventName, const FStrin
 		}
 		else if (EnumHasAllFlags((EMessageAuthorityType)Type, EMessageTypeClient))
 		{
-			if (NetMode == NM_DedicatedServer && NetMode == NM_ListenServer)
-				{}
+			if (NetMode == NM_DedicatedServer || NetMode == NM_ListenServer)
+			{
+				break;
+			}
 		}
 		else if (EnumHasAllFlags((EMessageAuthorityType)Type, EMessageTypeServer))
 		{

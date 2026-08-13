@@ -9,6 +9,7 @@
 #include "GMPMeta.h"
 #include "GMPSignalsImpl.h"
 #include "GMPSignalsInc.h"
+#include "GMPStoreCollection.h"
 #include "GMPUtils.h"
 #include "GMPWorldLocals.h"
 #include "HAL/ThreadSingleton.h"
@@ -145,7 +146,7 @@ namespace GMP
 	using FGMPMsgSignal = TSignal<false, FMessageBody&>;
 #endif
 #if GMP_WITH_STATIC_STORE
-	static FSignalStore* TryAdoptStaticStore(FGMPSignalMap& Map, FName Name)
+	static FSignalStore* FindStaticStoreByName(FName Name)
 	{
 		static TMap<FName, FSignalStore*> Index;
 		static int32 BuiltCount = -1;
@@ -158,14 +159,34 @@ namespace GMP
 					Index.Add(FName(E.KeyStr), E.Store);
 			BuiltCount = Registry.Num();
 		}
-		if (FSignalStore** Found = Index.Find(Name))
+		FSignalStore** Found = Index.Find(Name);
+		return Found ? *Found : nullptr;
+	}
+
+	static FSignalStore* TryAdoptStaticStore(FGMPSignalMap& Map, FName Name)
+	{
+		if (FSignalStore* Found = FindStaticStoreByName(Name))
 		{
 			FSignalBase& Base = Map.Add(Name);
-			Base.Store = GMPBindStaticStore(*Found, Name);  // no-delete shared ref over the static object
-			return *Found;
+			Base.Store = GMPBindStaticStore(Found, Name);  // no-delete shared ref over the static object
+			return Found;
 		}
 		return nullptr;
 	}
+
+#if !UE_BUILD_SHIPPING
+	static void CheckNameStoreCoherent(FName Name, const FSignalBase* Base)
+	{
+		if (!Base || !Base->Store.IsValid())
+			return;
+		FSignalStore* Static = FindStaticStoreByName(Name);
+		ensureAlwaysMsgf(!Static || Static == Base->Store.Get(),
+						 TEXT("GMP split-brain on key [%s]: native static store %p vs name-path store %p (listeners on the name path will MISS native sends)"),
+						 *Name.ToString(),
+						 Static,
+						 Base->Store.Get());
+	}
+#endif
 
 	static FSignalBase* FindSigWithStaticAdopt(FGMPSignalMap& Map, FName Name)
 	{
@@ -194,6 +215,9 @@ namespace GMP
 				Find->Store = FGMPMsgSignal::MakeSignals(Name);
 			}
 		}
+#if GMP_WITH_STATIC_STORE && !UE_BUILD_SHIPPING
+		CheckNameStoreCoherent(Name, Find);
+#endif
 		return Find;
 	}
 	template GMP_API FSignalBase* GetSig<true>(FGMPSignalMap& Map, FName Name);
@@ -881,6 +905,8 @@ namespace GMP
 
 	void FMessageHub::UnbindMessageImpl(const FName& MessageKey, FGMPKey InKey)
 	{
+		if (InKey && GMPHasStoreListeners())
+			GMPUnlistenStore(MessageKey, InKey);
 #if GMP_WITH_STATIC_STORE
 		if (auto Ptr = static_cast<FGMPMsgSignal*>(FindSigWithStaticAdopt(MessageSignals, MessageKey)))
 #else
@@ -898,6 +924,8 @@ namespace GMP
 
 	void FMessageHub::UnbindMessageImpl(const FName& MessageKey, const UObject* Listener)
 	{
+		if (Listener && GMPHasStoreListeners())
+			GMPUnlistenStore(MessageKey, Listener);
 #if GMP_WITH_STATIC_STORE
 		if (auto Ptr = static_cast<FGMPMsgSignal*>(FindSigWithStaticAdopt(MessageSignals, MessageKey)))
 #else
@@ -915,6 +943,8 @@ namespace GMP
 
 	void FMessageHub::UnbindMessageImpl(const FName& MessageKey, const UObject* Listener, FSigSource InSigSrc)
 	{
+		if (Listener && GMPHasStoreListeners())
+			GMPUnlistenStore(MessageKey, Listener);
 #if GMP_WITH_STATIC_STORE
 		if (auto Ptr = static_cast<FGMPMsgSignal*>(FindSigWithStaticAdopt(MessageSignals, MessageKey)))
 #else
@@ -932,6 +962,9 @@ namespace GMP
 
 	FGMPKey FMessageHub::NotifyMessageImpl(FSignalBase* Ptr, const FName& MessageKey, FSigSource InSigSrc, FTypedAddresses& Params)
 	{
+#if GMP_WITH_STATIC_STORE && !UE_BUILD_SHIPPING
+		CheckNameStoreCoherent(MessageKey, Ptr);
+#endif
 		GMP_MSGBODY_ON_STACK(Msg, Params.Num(), Params.GetData(), MessageKey, InSigSrc, FGMPKey{});
 		auto Seq = Msg.Sequence();
 		{
@@ -967,6 +1000,9 @@ namespace GMP
 
 	bool FMessageHub::NotifyMessageDirectImpl(FSignalBase* Ptr, const FName& MessageKey, FSigSource InSigSrc, FTypedAddresses& Param)
 	{
+#if GMP_WITH_STATIC_STORE && !UE_BUILD_SHIPPING
+		CheckNameStoreCoherent(MessageKey, Ptr);
+#endif
 		auto SignalPtr = static_cast<FGMPMsgSignal*>(Ptr);
 #if WITH_EDITOR
 		if (GIsEditor)
@@ -1264,7 +1300,13 @@ namespace GMP
 		{
 			Find = &StoreSourceMsgs(Ptr->Store.Get()).FindOrAdd(InSigSrc);
 		}
+		// diff against the old table first (it is about to be overwritten), publish once the store holds the new one
+		FGMPStoreDiff CollectionDiff;
+		if (GMPHasStoreListeners())
+			GMPComputeStoreDiff(Ptr->Store->MessageKey, Find, Params, CollectionDiff);
+
 		Find->InitAsMsgStore(Ptr->Store->MessageKey, Params, Flags & FGMPStructUnion::MsgStoreFlagsMask);
+		GMPPublishStoreDiff(InSigSrc, Ptr->Store->MessageKey, CollectionDiff);
 #if GMP_MSG_HOLDER_DUPLICATED
 		if (UWorld* ObjWorld = InSigSrc.GetSigSourceWorld())
 		{
@@ -1272,6 +1314,17 @@ namespace GMP
 		}
 #endif
 	}
+#if GMP_WITH_MSG_HOLDER
+	FGMPStructUnion* FMessageHub::FindStoredMessage(const FName& MessageKey, FSigSource InSigSrc) const
+	{
+		auto Ptr = FindSig(const_cast<FGMPSignalMap&>(MessageSignals), MessageKey);
+		if (!Ptr || !Ptr->Store.IsValid())
+			return nullptr;
+		FSignalStore* Store = Ptr->Store.Get();
+		return StoreHasSourceMsgs(Store) ? StoreSourceMsgs(Store).Find(InSigSrc) : nullptr;
+	}
+#endif
+
 #if GMP_WITH_DIRECT_SIGNAL && GMP_WITH_MSG_HOLDER
 	FGMPStructUnion* FMessageHub::FindStoredMessageDirect(FSignalStore* DirectStore, FSigSource InSigSrc) const
 	{

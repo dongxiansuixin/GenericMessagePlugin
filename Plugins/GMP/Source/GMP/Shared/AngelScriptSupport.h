@@ -136,7 +136,8 @@ struct FAsCallbackHolder
 
 // Pushes GMP message params onto the script context and invokes the callback. Params are normalized to (paddrs, count,
 // key, typename-source) by both dispatch paths (raw paddrs+extra, or FMessageBody), mirroring the Lua/Puerts adapters.
-inline void GMP_As_InvokeListenCallback(const FGMPTypedAddr* Paddrs, int32 NumArgs, FName KeyName, const FName* InRawTypeNames, const TArray<FName>* InMetaTypes, const FAsCallbackHolder& Holder)
+// bSkipSigCheck: a row handler's (int32 Row, <element>) shape is fixed by GMP, never matching the tag signature.
+inline void GMP_As_InvokeListenCallback(const FGMPTypedAddr* Paddrs, int32 NumArgs, FName KeyName, const FName* InRawTypeNames, const TArray<FName>* InMetaTypes, const FAsCallbackHolder& Holder, bool bSkipSigCheck = false)
 {
 	if (!ensure(Holder.Func))
 		return;
@@ -164,7 +165,7 @@ inline void GMP_As_InvokeListenCallback(const FGMPTypedAddr* Paddrs, int32 NumAr
 		ArgNames.Add(GetTypeName(Idx));
 	const GMP::FArrayTypeNames* OldParams = nullptr;
 	GMP::FMessageHub::FTagTypeSetter SetMsgTagType(TEXT("AngelScript"));
-	if (!ensure(GMP::FMessageHub::IsSignatureCompatible(false, KeyName, ArgNames, OldParams)))
+	if (!bSkipSigCheck && !ensure(GMP::FMessageHub::IsSignatureCompatible(false, KeyName, ArgNames, OldParams)))
 	{
 		GMP_WARNING(TEXT("SignatureMismatch On AngelScript Listen %s"), *KeyName.ToString());
 		return;
@@ -211,7 +212,7 @@ inline void GMP_As_InvokeListenCallback(const FGMPTypedAddr* Paddrs, int32 NumAr
 		GMP_WARNING(TEXT("AngelScript callback did not finish for %s (code %d)"), *KeyName.ToString(), R);
 }
 
-// GMP.ListenObjectMessage(WatchedObj, MsgKey, WeakObj, callback [,Times]) -> key. DirectStore (key-固化, direct-signal
+// GMP.ListenObjectMessage(WatchedObj, MsgKey, WeakObj, callback [,Times]) -> key. DirectStore (key, direct-signal
 // only) is the pre-resolved static store for this key; when non-null listen binds by store and skips the FName/TMap lookup.
 inline int64 As_ListenObjectMessage(UObject* WatchedObject, const FString& MsgKeyStr, UObject* WeakObj, asIScriptFunction* Callback, int32 LeftTimes = -1, GMP::FSignalStore* DirectStore = nullptr)
 {
@@ -409,7 +410,7 @@ inline int64 As_ListenObjectMessageMethod(UObject* WeakObj, const FString& MsgKe
 // the funcdef handle / typed args from asIScriptGeneric and forwards to the weak-typed runtime above.
 
 // Per-tag context carried as the bound function's UserData (FAngelscriptBinds::OnBind -> ScriptFunction->SetUserData).
-// CachedStore is the compile-time-equivalent direct-signal store resolved once at bind time (key-固化 for AngelScript,
+// CachedStore is the compile-time-equivalent direct-signal store resolved once at bind time (for AngelScript,
 // whose per-tag binds are registered at runtime rather than codegen'd), so listen/notify skip the FName/TMap lookup.
 struct FGMPTypedTagCtx
 {
@@ -484,7 +485,7 @@ inline void As_TypedNotify_Generic(asIScriptGeneric* Gen)
 
 // Generic thunk for Listen_<id>(UObject WatchedObj, UObject WeakObj, FOn_<id>@ cb, int Times):
 // args (0)=WatchedObj (1)=WeakObj (2)=funcdef handle (3)=Times. The signature mirrors the weak-typed ListenObjectMessage
-// minus the key literal, so the preprocessor无感 rewrite is a pure "drop the key arg + rename to Listen_<id>".
+// minus the key literal, so the preprocessor rewrite is a pure "drop the key arg + rename to Listen_<id>".
 inline void As_TypedListen_Generic(asIScriptGeneric* Gen)
 {
 	auto* Ctx = static_cast<FGMPTypedTagCtx*>(Gen->GetFunction()->GetUserData());
@@ -506,12 +507,37 @@ inline FString GMP_As_TagToId(const FString& TagStr)
 	return Id;
 }
 
-// key ("Player.Hurt") -> id ("Player_Hurt") map, filled at bind time; the preprocessor无感 rewrite consults it to map a
+// key ("Player.Hurt") -> id ("Player_Hurt") map, filled at bind time; the preprocessor rewrite consults it to map a
 // literal key in a weak-typed GMP call onto the strongly-typed Listen_<id>/Notify_<id> registered for that tag.
 inline TMap<FString, FString>& GMP_As_KeyToId()
 {
 	static TMap<FString, FString> Map;
 	return Map;
+}
+
+// Generic thunk for asListenRow_<id>: bridges the shared row pair to the AngelScript callback.
+inline void As_TypedListenRow_Generic(asIScriptGeneric* Gen)
+{
+	auto* Ctx = static_cast<FGMPTypedTagCtx*>(Gen->GetFunction()->GetUserData());
+	UObject* WatchedObj = static_cast<UObject*>(Gen->GetArgObject(0));
+	UObject* WeakObj = static_cast<UObject*>(Gen->GetArgObject(1));
+	const int32 Index = (int32)Gen->GetArgDWord(2);
+	asIScriptFunction* Callback = static_cast<asIScriptFunction*>(Gen->GetArgObject(3));
+	const int32 Times = Gen->GetArgCount() > 4 ? (int32)Gen->GetArgDWord(4) : -1;
+	if (!ensure(Ctx && Callback))
+	{
+		Gen->SetReturnQWord(0);
+		return;
+	}
+
+	asIScriptContext* AsCtx = asGetActiveContext();
+	const auto SigSrc = WatchedObj ? FGMPSigSource(WatchedObj) : FGMPSigSource(AsCtx);
+	auto Holder = MakeShared<FAsCallbackHolder>(Callback);
+	const FGMPKey RetKey = GMP::GMPListenScriptRows(
+		SigSrc, Ctx->Key, WeakObj, Index,
+		[Holder, Key{Ctx->Key}](const FGMPTypedAddr* Addrs, int32 Num, const UScriptStruct*) { GMP_As_InvokeListenCallback(Addrs, Num, Key, nullptr, nullptr, *Holder, /*bSkipSigCheck*/ true); },
+		Times);
+	Gen->SetReturnQWord((asQWORD)(uint64)RetKey);
 }
 
 // Registers Listen_<id>/Notify_<id> for every tag in the runtime signature table (UGMPMeta). Call once the AS engine
@@ -539,19 +565,31 @@ inline void GMP_RegisterTypedBinds(const UObject* WorldContext)
 
 		FGMPTypedTagCtx* Ctx = new FGMPTypedTagCtx{Tag, ParamTypes};  // leaked intentionally: lives with the engine binding
 #if GMP_WITH_DIRECT_SIGNAL
-		// key-固化: resolve the direct-signal store once at bind time so runtime listen/notify skip the FName/TMap lookup.
+		// key: resolve the direct-signal store once at bind time so runtime listen/notify skip the FName/TMap lookup.
 		Ctx->CachedStore = FGMPHelper::GetMessageHub()->GetDirectStoreByKey(Tag);
 #endif
 		FAngelscriptBinds::BindGlobalGenericFunction(TCHAR_TO_UTF8(*FString::Printf(TEXT("int64 asListen_%s(UObject WatchedObj, UObject WeakObj, FOn_%s@ cb, int Times = -1)"), *Id, *Id)), &As_TypedListen_Generic, Ctx);
 		FAngelscriptBinds::BindGlobalGenericFunction(TCHAR_TO_UTF8(*FString::Printf(TEXT("void asNotify_%s(UObject Sender%s)"), *Id, *ParamDecl)), &As_TypedNotify_Generic, Ctx);
+
+		// A collection tag is a lone TArray<T>: add a row funcdef so a script can follow one slot or every changed row.
+		if (ParamTypes.Num() == 1)
+		{
+			const FString ParamStr = ParamTypes[0].ToString();
+			if (ParamStr.StartsWith(TEXT("TArray<")) && ParamStr.EndsWith(TEXT(">")))
+			{
+				const FString ElemType = GMP_AsTypeName(*ParamStr.Mid(7, ParamStr.Len() - 8));
+				Engine->RegisterFuncdef(TCHAR_TO_UTF8(*FString::Printf(TEXT("void FOnRow_%s(int Row, %s Item)"), *Id, *ElemType)));
+				FAngelscriptBinds::BindGlobalGenericFunction(TCHAR_TO_UTF8(*FString::Printf(TEXT("int64 asListenRow_%s(UObject WatchedObj, UObject WeakObj, int Index, FOnRow_%s@ cb, int Times = -1)"), *Id, *Id)), &As_TypedListenRow_Generic, Ctx);
+			}
+		}
 	});
 }
 
-// ---- Preprocessor无感 rewrite (block③). Hooks AngelScript's official FAngelscriptPreprocessor::OnPostProcessCode (fires
+// ---- Preprocessor rewrite (block③). Hooks AngelScript's official FAngelscriptPreprocessor::OnPostProcessCode (fires
 // after all built-in transforms, before the code is handed to the compiler; same pipeline the plugin uses to fold n!"X"
 // literals into __STATIC_NAME). Rewrites weak-typed GMP::(Listen|Notify)ObjectMessage(... "key" ...) into the strongly-
 // typed GMP::Listen_<id>/Notify_<id> (drops the key literal, renames), so usage scripts stay unchanged yet gain the VM-
-// direct (block①) + key-固化 (block②) fast paths. Only calls whose key argument is a plain string literal are rewritten.
+// direct (block①) + key (block②) fast paths. Only calls whose key argument is a plain string literal are rewritten.
 
 // Splits a call's argument-list source (text strictly inside the outer parens) into top-level args, honoring nested
 // (), [], <>, string literals and // /* */ comments. Returns the [start,end) char range of each top-level argument.
@@ -705,7 +743,7 @@ inline void GMP_As_InstallPreprocessorHook()
 // 4. the editor codegen (FGMPAngelScriptCodeGen) writes matching GMPMessages.as declaration stubs for compile-time checking + IntelliSense.
 // 5. (optional, block③) call AngelScriptSupport::GMP_As_InstallPreprocessorHook() once at startup so usage scripts that write the
 //    weak-typed GMP::(Listen|Notify)ObjectMessage(..., "key", ...) are rewritten to the strongly-typed Listen_<id>/Notify_<id>
-//    at preprocess time -- source unchanged, yet they gain the VM-direct (block①) + key-固化 (block②) fast paths.
+//    at preprocess time -- source unchanged, yet they gain the VM-direct (block①) + key (block②) fast paths.
 
 #if 0
 // GMP.as (AngelScript)
@@ -726,7 +764,7 @@ int64 Key = GMP::asListen_Player_Hurt(null, this, function(int Damage, AActor Ca
 GMP::asNotify_Player_Hurt(this, 42, causer);
 GMP::UnbindObjectMessage("Player.Hurt", this);
 
-// example.as (无感, block③: weak-typed with a literal key -> rewritten to the strongly-typed calls above at preprocess time):
+// example.as (block③: weak-typed with a literal key -> rewritten to the strongly-typed calls above at preprocess time):
 GMP::ListenObjectMessage(null, "Player.Hurt", this, function(int Damage, AActor Causer) { Print("hurt " + Damage); });
 GMP::NotifyObjectMessage(this, "Player.Hurt", 42, causer);
 #endif

@@ -2,13 +2,19 @@
 //
 // JsonDom parse implementation — the sole place that includes rapidjson.
 // Two modes (selected in JsonEncoding.h):
-//   - default (inline header-only): JSONDOM_IMPL_INLINE == inline; JsonSerializer.h auto-includes
-//     this file, so any TU that includes the header gets the impl (rapidjson comes with it).
-//   - JSONDOM_ISOLATED_IMPL: JSONDOM_IMPL_INLINE is empty; a single host TU includes this file once,
-//     keeping rapidjson out of every other TU.
+//   - default (inline header-only): entry points are inline; JsonSerializer.h auto-includes this
+//     file, so any TU that includes the header gets the impl (rapidjson comes with it).
+//   - JSONDOM_ISOLATED_IMPL: a single host TU includes this file once, keeping rapidjson out of
+//     every other TU; predefine JSONDOM_API to a host export macro to share it across modules.
 // The platform layer (CoreMinimal.h / UECompat.h) must supply TCHAR/FString/TArray/TSharedPtr and
 // JSONDOM_ENCODING_UTF8 before this file is reached.
+//
+// A content guard, not just `#pragma once`: two vendored copies of this package are two files to
+// `#pragma once` but one implementation here, and it may be defined only once.
 #pragma once
+
+#ifndef UNREAL_JSONDOM_IMPL_INL
+#define UNREAL_JSONDOM_IMPL_INL
 
 #include "JsonDom/JsonSerializer.h"
 #include "JsonDom/JsonEncoding.h"
@@ -25,6 +31,7 @@ namespace JSONDOM_NAMESPACE
 	using FRapidDocument = rapidjson::GenericDocument<FRapidEncoding>;
 	using FRapidValue = rapidjson::GenericValue<FRapidEncoding>;
 
+	// Build an arena node subtree from a rapidjson value (parse -> arena tree, single doc).
 	JSONDOM_IMPL_INLINE FArenaNode* FromRapid(const TSharedPtr<FArenaDoc>& D, const FRapidValue& RV)
 	{
 		if (RV.IsObject())
@@ -62,10 +69,13 @@ namespace JSONDOM_NAMESPACE
 
 // Single Deserialize (object/value handle are the same type). Requires an object top level (matches the
 // legacy object-overload behavior every call site relies on: `if (!Deserialize(R, Root) || !Root.IsValid())`).
-JSONDOM_IMPL_INLINE bool FJsonSerializer::Deserialize(const TSharedRef<FJsonStringReader>& Reader, FJsonValuePtr& OutValue)
+JSONDOM_API bool FJsonSerializer::Deserialize(const TSharedRef<FJsonStringReader>& Reader, FJsonValuePtr& OutValue)
 {
 	FRapidDocument Doc;
-	Doc.Parse(*Reader->Content);   // native TCHAR buffer; encoding matches document instantiation
+	// Native TCHAR buffer; encoding matches the document instantiation. Full precision because the
+	// default fast path is off by up to a few ulp, and a shortest-round-trip number has to come back
+	// as the same double.
+	Doc.Parse<rapidjson::kParseFullPrecisionFlag>(*Reader->Content);
 	if (Doc.HasParseError() || !Doc.IsObject()) return false;
 	auto D = MakeShared<FArenaDoc>();
 	FArenaNode* Root = FromRapid(D, Doc);
@@ -75,10 +85,10 @@ JSONDOM_IMPL_INLINE bool FJsonSerializer::Deserialize(const TSharedRef<FJsonStri
 	return true;
 }
 
-JSONDOM_IMPL_INLINE bool FJsonSerializer::DeserializeArray(const TSharedRef<FJsonStringReader>& Reader, FJsonArrayView& OutArray)
+JSONDOM_API bool FJsonSerializer::DeserializeArray(const TSharedRef<FJsonStringReader>& Reader, FJsonArrayView& OutArray)
 {
 	FRapidDocument Doc;
-	Doc.Parse(*Reader->Content);
+	Doc.Parse<rapidjson::kParseFullPrecisionFlag>(*Reader->Content);
 	if (Doc.HasParseError() || !Doc.IsArray()) return false;
 	auto D = MakeShared<FArenaDoc>();
 	FArenaNode* Root = FromRapid(D, Doc);
@@ -89,3 +99,5 @@ JSONDOM_IMPL_INLINE bool FJsonSerializer::DeserializeArray(const TSharedRef<FJso
 }
 
 }  // namespace JSONDOM_NAMESPACE
+
+#endif // UNREAL_JSONDOM_IMPL_INL

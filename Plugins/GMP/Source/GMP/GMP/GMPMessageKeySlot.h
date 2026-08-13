@@ -93,8 +93,8 @@ public:
 	};
 
 	static void Register(FNode& Node) noexcept;
-	static void ConstructAll();
-
+	static void ConstructAll(const TCHAR* Reason);
+ 
 private:
 	static FNode*& Head() noexcept;
 };
